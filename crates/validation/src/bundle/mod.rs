@@ -7,7 +7,8 @@ use alloy::{
 use angstrom_metrics::validation::ValidationMetrics;
 use angstrom_types::{
     contract_payloads::angstrom::{AngstromBundle, BundleGasDetails},
-    primitive::CHAIN_ID
+    primitive::CHAIN_ID,
+    traits::BundleProcessing
 };
 use eyre::eyre;
 use futures::Future;
@@ -21,8 +22,7 @@ use revm::{
 use tokio::runtime::Handle;
 
 use crate::{
-    common::{TokenPriceGenerator, key_split_threadpool::KeySplitThreadpool},
-    order::sim::console_log::CallDataInspector
+    common::key_split_threadpool::KeySplitThreadpool, order::sim::console_log::CallDataInspector
 };
 
 pub mod validator;
@@ -76,7 +76,6 @@ where
         &self,
         sender: tokio::sync::oneshot::Sender<eyre::Result<BundleGasDetails>>,
         bundle: AngstromBundle,
-        price_gen: &TokenPriceGenerator,
         thread_pool: &mut KeySplitThreadpool<
             Address,
             Pin<Box<dyn Future<Output = ()> + Send + Sync>>,
@@ -88,8 +87,6 @@ where
         let node_address = self.node_address;
         let angstrom_address = self.angstrom_address;
         let mut db = self.db.clone();
-
-        let conversion_lookup = price_gen.generate_lookup_map();
 
         thread_pool.spawn_raw(Box::pin(async move {
             let pool_manager_addr = *angstrom_types::primitive::POOL_MANAGER_ADDRESS.get().unwrap();
@@ -123,7 +120,7 @@ where
             }
 
             metrics.simulate_bundle(|| {
-                let bundle = bundle.pade_encode();
+                let encoded_bundle = bundle.pade_encode();
                 let console_log_inspector = CallDataInspector {};
 
                  let mut evm = Context {
@@ -148,7 +145,7 @@ where
                         tx.chain_id = Some(*CHAIN_ID.get().unwrap());
                         tx.data =
                         angstrom_types::contract_bindings::angstrom::Angstrom::executeCall::new((
-                            bundle.into(),
+                            encoded_bundle.into(),
                         ))
                         .abi_encode()
                         .into();
@@ -170,12 +167,12 @@ where
                 };
 
                 if !result.is_success() {
-                    tracing::warn!(?result);
+                    tracing::error!(?result, block_number=%number + 1);
                     let _ = sender.send(Err(eyre!("transaction simulation failed")));
                     return;
                 }
 
-                let res = BundleGasDetails::new(conversion_lookup,result.gas_used());
+                let res = BundleGasDetails::new(result.gas_used());
                 let _ = sender.send(Ok(res));
             });
         }))

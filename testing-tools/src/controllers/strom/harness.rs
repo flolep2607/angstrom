@@ -11,7 +11,7 @@ use angstrom_eth::manager::EthEvent;
 use angstrom_network::{PoolManagerBuilder, StromNetworkHandle, pool_manager::PoolHandle};
 use angstrom_types::{
     block_sync::{BlockSyncProducer, GlobalBlockSync},
-    consensus::ConsensusRoundName,
+    consensus::{ConsensusRoundName, SlotClock, SystemTimeSlotClock},
     contract_bindings::angstrom::Angstrom::PoolKey,
     contract_payloads::{
         CONFIG_STORE_SLOT, POOL_CONFIG_STORE_ENTRY_SIZE,
@@ -218,7 +218,7 @@ pub async fn initialize_strom_components_at_block<Provider: WithWalletProvider>(
     let uniswap_pools = uniswap_pool_manager.pools();
     let pool_ids = uniswap_pool_manager.pool_addresses().collect::<Vec<_>>();
 
-    executor.spawn_critical("uniswap pool manager", Box::pin(uniswap_pool_manager));
+    executor.spawn_critical_task("uniswap pool manager", Box::pin(uniswap_pool_manager));
     // EXTERNAL DATA - reads the price history from the chain to establish the price
     // background. Can be snapshotted or re-read from the chain
     let price_generator = TokenPriceGenerator::new(
@@ -306,7 +306,9 @@ pub async fn initialize_strom_components_at_block<Provider: WithWalletProvider>(
         matching_handle,
         global_block_sync.clone(),
         handles.consensus_rx_rpc,
-        Some(state_tx)
+        Some(state_tx),
+        consensus::ConsensusTimingConfig::default(),
+        SystemTimeSlotClock::new_default().unwrap()
     );
 
     executor.spawn_critical_with_graceful_shutdown_signal("consensus", move |grace| {

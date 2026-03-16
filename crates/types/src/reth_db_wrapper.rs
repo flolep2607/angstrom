@@ -158,6 +158,10 @@ impl<DB> StateProviderFactory for RethDbWrapper<DB>
 where
     DB: StateProviderFactory + Unpin + Clone + 'static
 {
+    fn maybe_pending(&self) -> ProviderResult<Option<reth_provider::StateProviderBox>> {
+        self.db.maybe_pending()
+    }
+
     fn latest(&self) -> reth_provider::ProviderResult<reth_provider::StateProviderBox> {
         self.db.latest()
     }
@@ -242,6 +246,16 @@ where
         self.db
             .state_by_block_id(self.block.load(std::sync::atomic::Ordering::Relaxed).into())?
             .account_balance(addr)
+    }
+
+    fn storage_by_hashed_key(
+        &self,
+        address: Address,
+        hashed_storage_key: StorageKey
+    ) -> ProviderResult<Option<StorageValue>> {
+        self.db
+            .state_by_block_id(self.block.load(std::sync::atomic::Ordering::Relaxed).into())?
+            .storage_by_hashed_key(address, hashed_storage_key)
     }
 }
 

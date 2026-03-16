@@ -1,14 +1,11 @@
 use std::pin::Pin;
 
-use alloy::{
-    eips::{eip1559::ETHEREUM_BLOCK_GAS_LIMIT_30M, eip2718::Encodable2718},
-    primitives::{Address, TxHash},
-    providers::Provider
-};
+use alloy::{eips::eip2718::Encodable2718, primitives::Address, providers::Provider};
 use angstrom_types::{
     contract_payloads::angstrom::AngstromBundle,
     primitive::{AngstromMetaSigner, AngstromSigner},
-    submission::{ChainSubmitter, TxFeatureInfo}
+    submission::{ChainSubmitter, SubmissionResult, TxFeatureInfo},
+    traits::BundleProcessing
 };
 use futures::Future;
 
@@ -23,14 +20,19 @@ impl ChainSubmitter for AnvilSubmissionProvider {
         self.angstrom_address
     }
 
+    fn submitter_type(&self) -> &'static str {
+        "anvil"
+    }
+
     fn submit<'a, S: AngstromMetaSigner>(
         &'a self,
         signer: &'a AngstromSigner<S>,
         bundle: Option<&'a AngstromBundle>,
         tx_features: &'a TxFeatureInfo
-    ) -> Pin<Box<dyn Future<Output = eyre::Result<Option<TxHash>>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = eyre::Result<Vec<SubmissionResult>>> + Send + 'a>> {
         Box::pin(async move {
-            let Some(bundle) = bundle else { return Ok(None) };
+            let start = std::time::Instant::now();
+            let Some(bundle) = bundle else { return Ok(vec![]) };
 
             let pool_manager_addr = *angstrom_types::primitive::POOL_MANAGER_ADDRESS
                 .get()
@@ -61,17 +63,25 @@ impl ChainSubmitter for AnvilSubmissionProvider {
             }
 
             let tx = self
-                .build_and_sign_tx_with_gas(signer, bundle, tx_features, |tx| async move {
-                    tx.gas_limit(ETHEREUM_BLOCK_GAS_LIMIT_30M)
-                })
+                .build_and_sign_tx_with_gas(signer, bundle, tx_features)
                 .await;
             let hash = *tx.tx_hash();
             let encoded = tx.encoded_2718();
 
+            let latency_ms = start.elapsed().as_millis() as u64;
+
             self.provider
                 .send_raw_transaction(&encoded)
                 .await
-                .map(|_| Some(hash))
+                .map(|_| {
+                    vec![SubmissionResult {
+                        tx_hash: Some(hash),
+                        submitter_type: "anvil".to_string(),
+                        endpoint: "anvil://local".to_string(),
+                        success: true,
+                        latency_ms
+                    }]
+                })
                 .map_err(Into::into)
         })
     }

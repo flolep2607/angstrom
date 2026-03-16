@@ -6,16 +6,15 @@ use std::{
 use alloy_primitives::{I256, Sign, U256};
 use angstrom_types::{
     contract_payloads::angstrom::TopOfBlockOrder as ContractTopOfBlockOrder,
-    matching::{
-        SqrtPriceX96, get_quantities_at_price,
-        uniswap::{Direction, Quantity}
-    },
+    matching::get_quantities_at_price,
     orders::{NetAmmOrder, OrderFillState, OrderId, OrderOutcome, PoolSolution},
+    primitive::{Direction, Quantity, Ray, SqrtPriceX96},
     sol_bindings::{
-        RawPoolOrder, Ray,
+        RawPoolOrder,
         grouped_orders::{AllOrders, OrderWithStorageData},
         rpc_orders::TopOfBlockOrder
     },
+    traits::TopOfBlockOrderRewardCalc,
     uni_structure::pool_swap::PoolSwapResult
 };
 use base64::Engine;
@@ -39,6 +38,7 @@ struct OrderLiquidity {
 /// Enum describing what kind of ToB order we want to use to set the initial AMM
 /// price for our DeltaMatcher
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum DeltaMatcherToB {
     /// No ToB Order at all, no price movement
     None,
@@ -87,8 +87,14 @@ impl<'a> DeltaMatcher<'a> {
             // If we have an order, apply that to the AMM start price
             DeltaMatcherToB::Order(ref tob) => book.amm().map(|snapshot| {
                 ContractTopOfBlockOrder::calc_vec_and_reward(tob, snapshot)
-                    .expect("Order structure should be valid and never fail")
-                    .0
+                    .inspect_err(|e| {
+                        tracing::error!(
+                            "reorg caused tob invalidation, running matcher without. {}",
+                            e.to_string()
+                        )
+                    })
+                    .map(|e| e.0)
+                    .unwrap_or_else(|_| snapshot.noop())
             }),
             // If we have a fixed shift, apply that to the AMM start price (Not yet operational)
             DeltaMatcherToB::FixedShift(..) => panic!("not implemented"),
@@ -181,12 +187,12 @@ impl<'a> DeltaMatcher<'a> {
         self.book
             .bids()
             .iter()
-            .filter(|o| price <= o.pre_fee_price(self.fee).inv_ray_round(false))
+            .filter(|o| price <= o.pre_fee_and_gas_price(self.fee).inv_ray_round(false))
             .chain(
                 self.book
                     .asks()
                     .iter()
-                    .filter(|o| price >= o.pre_fee_price(self.fee))
+                    .filter(|o| price >= o.pre_fee_and_gas_price(self.fee))
             )
             .filter(|o| !killed.contains(&o.order_id))
             .for_each(|o| {
@@ -507,7 +513,12 @@ impl<'a> DeltaMatcher<'a> {
                     // Killed orders are killed
                     OrderFillState::Killed
                 } else {
-                    match (o.price_t1_over_t0().cmp(&fetch.ucp), o.is_bid) {
+                    let price = if o.is_bid {
+                        o.pre_fee_and_gas_price(self.fee).inv_ray_round(false)
+                    } else {
+                        o.pre_fee_and_gas_price(self.fee)
+                    };
+                    match (price.cmp(&fetch.ucp), o.is_bid) {
                         // A bid with a higher price than UCP or an ask with a lower price than UCP
                         // is filled
                         (Ordering::Greater, true) | (Ordering::Less, false) => {

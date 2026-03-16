@@ -22,6 +22,7 @@ use angstrom_rpc::{
 };
 use angstrom_types::{
     block_sync::{BlockSyncProducer, GlobalBlockSync},
+    consensus::{SlotClock, SystemTimeSlotClock},
     contract_bindings::{
         angstrom::Angstrom::PoolKey,
         controller_v_1::ControllerV1::{self, PoolConfigured, PoolRemoved}
@@ -31,7 +32,10 @@ use angstrom_types::{
     primitive::{AngstromSigner, UniswapPoolRegistry, try_init_with_chain_id, *},
     submission::{ChainSubmitterHolder, SubmissionHandler}
 };
-use consensus::{AngstromValidator, ConsensusHandler, ConsensusManager, ManagerNetworkDeps};
+use consensus::{
+    AngstromValidator, ConsensusHandler, ConsensusManager, ConsensusTimingConfig,
+    ManagerNetworkDeps
+};
 use futures::{Stream, StreamExt};
 use jsonrpsee::server::ServerBuilder;
 use matching_engine::MatchingManager;
@@ -290,7 +294,7 @@ impl ReplayRunner {
         tracing::debug!("uniswap configured");
 
         let uniswap_pools = uniswap_pool_manager.pools();
-        executor.spawn_critical(
+        executor.spawn_critical_task(
             "uniswap",
             Box::pin(
                 uniswap_pool_manager.instrument(span!(tracing::Level::ERROR, "pool manager",))
@@ -388,7 +392,7 @@ impl ReplayRunner {
 
         let addr = server.local_addr()?;
 
-        executor.spawn_critical(
+        executor.spawn_critical_task(
             "rpc",
             Box::pin(async move {
                 let mut rpcs = order_api.into_rpc();
@@ -437,7 +441,9 @@ impl ReplayRunner {
             matching_handle,
             global_block_sync.clone(),
             strom_handles.consensus_rx_rpc,
-            None
+            None,
+            ConsensusTimingConfig::default(),
+            SystemTimeSlotClock::new_default().unwrap()
         );
         executor.spawn_critical_with_graceful_shutdown_signal("consensus", move |grace| {
             consensus.run_till_shutdown(grace)
@@ -458,7 +464,7 @@ impl ReplayRunner {
             consensus_client.subscribe_consensus_round_event()
         );
 
-        executor.spawn_critical("amm quoting service", amm);
+        executor.spawn_critical_task("amm quoting service", amm);
 
         tracing::info!("created consensus manager");
         global_block_sync.finalize_modules();

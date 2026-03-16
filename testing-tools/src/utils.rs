@@ -1,4 +1,4 @@
-use std::{future::Future, path::Path, pin::Pin, sync::Arc};
+use std::{future::Future, path::Path, pin::Pin};
 
 use angstrom_types::testnet::InitialTestnetState;
 use reth_chainspec::MAINNET;
@@ -6,17 +6,19 @@ use reth_db::DatabaseEnv;
 use reth_node_ethereum::EthereumNode;
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_provider::providers::{BlockchainProvider, ReadOnlyConfig};
+use reth_tasks::Runtime;
 use tracing::Level;
 use tracing_subscriber::{
     EnvFilter, Layer, Registry, layer::SubscriberExt, util::SubscriberInitExt
 };
 
 use crate::agents::AgentConfig;
-pub type Provider = BlockchainProvider<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>;
+pub type Provider = BlockchainProvider<NodeTypesWithDBAdapter<EthereumNode, DatabaseEnv>>;
 
 pub fn load_reth_db(db_path: &Path) -> Provider {
+    let runtime = Runtime::test();
     let factory = EthereumNode::provider_factory_builder()
-        .open_read_only(MAINNET.clone(), ReadOnlyConfig::from_datadir(db_path))
+        .open_read_only(MAINNET.clone(), ReadOnlyConfig::from_datadir(db_path), runtime)
         .unwrap();
     BlockchainProvider::new(factory).unwrap()
 }
@@ -60,6 +62,10 @@ pub fn init_tracing(verbosity: u8) {
         layer_builder(format!("consensus={level}")),
         layer_builder(format!("validation={level}")),
         layer_builder(format!("order_pool={level}")),
+        layer_builder(format!("angstrom_types_primitives={level}")),
+        layer_builder(format!("angstrom_types_constants={level}")),
+        layer_builder(format!("angstrom_rpc_api={level}")),
+        layer_builder(format!("angstrom_rpc_types={level}")),
     ];
 
     tracing_subscriber::registry().with(layers).init();

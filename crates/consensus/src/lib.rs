@@ -1,26 +1,21 @@
 mod leader_selection;
 mod manager;
-
 use angstrom_types::consensus::ConsensusRoundOrderHashes;
+pub use angstrom_types::consensus::{
+    AngstromValidator, ConsensusDataWithBlock, ConsensusTimingConfig
+};
 pub use manager::*;
+
 pub mod rounds;
 use std::{collections::HashSet, pin::Pin};
 
 use alloy::primitives::{Address, Bytes};
 use futures::{Stream, StreamExt};
-pub use leader_selection::AngstromValidator;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{
     mpsc::{self, channel},
     oneshot
 };
 use tokio_stream::wrappers::ReceiverStream;
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ConsensusDataWithBlock<T> {
-    pub data:  T,
-    pub block: u64
-}
 
 pub trait ConsensusHandle: Send + Sync + Clone + Unpin + 'static {
     fn subscribe_empty_block_attestations(
@@ -34,12 +29,34 @@ pub trait ConsensusHandle: Send + Sync + Clone + Unpin + 'static {
     fn fetch_consensus_state(
         &self
     ) -> impl Future<Output = eyre::Result<ConsensusDataWithBlock<HashSet<AngstromValidator>>>> + Send;
+
+    fn is_round_closed(
+        &self
+    ) -> impl Future<Output = eyre::Result<ConsensusDataWithBlock<bool>>> + Send;
+
+    fn timings(
+        &self
+    ) -> impl Future<Output = eyre::Result<ConsensusDataWithBlock<ConsensusTimingConfig>>> + Send;
 }
 
 #[derive(Clone)]
 pub struct ConsensusHandler(pub tokio::sync::mpsc::UnboundedSender<ConsensusRequest>);
 
 impl ConsensusHandle for ConsensusHandler {
+    async fn timings(&self) -> eyre::Result<ConsensusDataWithBlock<ConsensusTimingConfig>> {
+        let (tx, rx) = oneshot::channel();
+        self.0.send(ConsensusRequest::Timing(tx))?;
+
+        rx.await.map_err(Into::into)
+    }
+
+    async fn is_round_closed(&self) -> eyre::Result<ConsensusDataWithBlock<bool>> {
+        let (tx, rx) = oneshot::channel();
+        self.0.send(ConsensusRequest::IsRoundClosed(tx))?;
+
+        rx.await.map_err(Into::into)
+    }
+
     async fn get_current_leader(&self) -> eyre::Result<ConsensusDataWithBlock<Address>> {
         let (tx, rx) = oneshot::channel();
         self.0.send(ConsensusRequest::CurrentLeader(tx))?;
@@ -85,6 +102,8 @@ impl ConsensusHandler {
 
 pub enum ConsensusRequest {
     CurrentLeader(oneshot::Sender<ConsensusDataWithBlock<Address>>),
+    IsRoundClosed(oneshot::Sender<ConsensusDataWithBlock<bool>>),
+    Timing(oneshot::Sender<ConsensusDataWithBlock<ConsensusTimingConfig>>),
     CurrentConsensusState(oneshot::Sender<ConsensusDataWithBlock<HashSet<AngstromValidator>>>),
     SubscribeAttestations(mpsc::Sender<ConsensusSubscriptionData>),
     SubscribeRoundEventOrders(mpsc::Sender<ConsensusSubscriptionData>)

@@ -18,7 +18,10 @@ use crate::common::TokenPriceGenerator;
 
 pub mod console_log;
 mod gas;
-pub use gas::{BOOK_GAS, BOOK_GAS_INTERNAL, TOB_GAS, TOB_GAS_INTERNAL};
+pub use gas::{
+    BOOK_GAS, BOOK_GAS_INTERNAL, SWITCH_WEI, TOB_GAS_INTERNAL_NORMAL, TOB_GAS_INTERNAL_SUB,
+    TOB_GAS_NORMAL, TOB_GAS_SUB
+};
 
 pub type GasUsed = u64;
 // needed for future use
@@ -59,7 +62,8 @@ where
         let span = error_span!("tob", ?hash, ?user);
         span.in_scope(|| {
             self.metrics.fetch_gas_for_user(true, || {
-                let gas_in_wei = self.gas_calculator.gas_of_tob_order(order, block)?;
+                let wei = conversion.base_wei;
+                let gas_in_wei = self.gas_calculator.gas_of_tob_order(order, block, wei)?;
                 // grab order tokens;
                 let (token0, token1, max_gas) = if order.asset_in < order.asset_out {
                     (order.asset_in, order.asset_out, order.max_gas_token_0())
@@ -67,10 +71,9 @@ where
                     (order.asset_out, order.asset_in, order.max_gas_token_0())
                 };
 
-                let conversion_factor = conversion
-                    .get_eth_conversion_price(token0, token1)
+                let gas_token_0 = conversion
+                    .get_eth_conversion_price(token0, token1, gas_in_wei)
                     .ok_or_else(|| eyre::eyre!("failed to get conversion price"))?;
-                let gas_token_0 = conversion_factor.inverse_quantity(gas_in_wei as u128, false);
 
                 // For TOB orders, given they are only valid for the current block,
                 // we return a error given the order will never be included.
@@ -104,11 +107,9 @@ where
                     (order.token_out(), order.token_in(), order.max_gas_token_0())
                 };
 
-                // grab price conversion
-                let conversion_factor = conversion
-                    .get_eth_conversion_price(token0, token1)
+                let gas_token_0 = conversion
+                    .get_eth_conversion_price(token0, token1, gas_in_wei)
                     .ok_or_else(|| eyre::eyre!("failed to get conversion price"))?;
-                let gas_token_0 = conversion_factor.inverse_quantity(gas_in_wei as u128, false);
 
                 // convert to u256 for overflow cases.
                 if gas_token_0 > max_gas {

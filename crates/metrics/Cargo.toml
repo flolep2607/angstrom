@@ -9,17 +9,20 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+alloy-primitives.workspace = true
+angstrom-rpc-types.workspace = true
 angstrom-types.workspace = true
 eyre.workspace = true
-hyper = { version = "1.6.0", features = ["server"] }
-jsonrpsee-server = "0.25.1"
+hyper = { workspace = true, features = ["server"] }
+jsonrpsee-server.workspace = true
 metrics.workspace = true
-metrics-exporter-prometheus = "0.16.2"
-metrics-process = "1"
-metrics-util = "0.20.0"
-prometheus = "0"
+metrics-exporter-prometheus.workspace = true
+metrics-process.workspace = true
+prometheus.workspace = true
+reth-node-metrics.workspace = true
 tokio = { workspace = true, features = ["full", "tracing"] }
-tower = "0.5.2"
+tokio-stream.workspace = true
+tower.workspace = true
 tracing.workspace = true
 
 [target.'cfg(unix)'.dependencies]

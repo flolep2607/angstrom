@@ -5,20 +5,25 @@ use std::{
 };
 
 use alloy::providers::Provider;
+use angstrom_metrics::{BlockMetricsWrapper, ConsensusMetricsWrapper};
 use angstrom_types::{
-    consensus::{ConsensusRoundName, PreProposalAggregation, Proposal, StromConsensusEvent},
+    consensus::{
+        ConsensusRoundName, PreProposalAggregation, Proposal, SlotClock, StromConsensusEvent
+    },
     contract_payloads::angstrom::{AngstromBundle, BundleGasDetails},
-    orders::PoolSolution,
+    orders::{OrderFillState, PoolSolution},
     primitive::AngstromMetaSigner,
-    sol_bindings::rpc_orders::AttestAngstromBlockEmpty
+    sol_bindings::rpc_orders::AttestAngstromBlockEmpty,
+    traits::BundleProcessing
 };
-use futures::{FutureExt, StreamExt, future::BoxFuture};
-use matching_engine::MatchingEngineHandle;
+use futures::{FutureExt, future::BoxFuture};
+use matching_engine::{MatchingEngineHandle, manager::MatchingEngineError};
 
 use super::{ConsensusState, SharedRoundState};
 use crate::rounds::{ConsensusMessage, preproposal_wait_trigger::LastRoundInfo};
 
-type MatchingEngineFuture = BoxFuture<'static, eyre::Result<(Vec<PoolSolution>, BundleGasDetails)>>;
+type MatchingEngineFuture =
+    BoxFuture<'static, Result<(Vec<PoolSolution>, BundleGasDetails), MatchingEngineError>>;
 
 /// Proposal State.
 ///
@@ -33,7 +38,8 @@ pub struct ProposalState {
     pre_proposal_aggs:      Vec<PreProposalAggregation>,
     proposal:               Option<Proposal>,
     last_round_info:        Option<LastRoundInfo>,
-    trigger_time:           Instant
+    trigger_time:           Instant,
+    block_height:           u64
 }
 
 impl ProposalState {
@@ -47,6 +53,36 @@ impl ProposalState {
         P: Provider + Unpin + 'static,
         Matching: MatchingEngineHandle
     {
+        // Record state transition metrics
+        let slot_offset_ms = handles.slot_offset_ms();
+        let orders = handles.order_storage.get_all_orders();
+        let limit_count = orders.limit.len();
+        let searcher_count = orders.searcher.len();
+
+        let metrics = BlockMetricsWrapper::new();
+        metrics.record_state_transition(
+            handles.block_height,
+            "Proposal",
+            slot_offset_ms,
+            limit_count,
+            searcher_count
+        );
+
+        // Count matching input orders from preproposal aggregations (pre-quorum)
+        let mut matching_limit = 0usize;
+        let mut matching_searcher = 0usize;
+        for agg in &pre_proposal_aggregation {
+            for pre in &agg.pre_proposals {
+                matching_limit += pre.limit.len();
+                matching_searcher += pre.searcher.len();
+            }
+        }
+        metrics.record_matching_input_pre_quorum(
+            handles.block_height,
+            matching_limit,
+            matching_searcher
+        );
+
         // queue building future
         waker.wake_by_ref();
         tracing::info!("proposal");
@@ -59,23 +95,27 @@ impl ProposalState {
             pre_proposal_aggs: pre_proposal_aggregation.into_iter().collect::<Vec<_>>(),
             submission_future: None,
             proposal: None,
-            trigger_time
+            trigger_time,
+            block_height: handles.block_height
         }
     }
 
     fn try_build_proposal<P, Matching, S: AngstromMetaSigner>(
         &mut self,
         cx: &mut Context<'_>,
-        result: eyre::Result<(Vec<PoolSolution>, BundleGasDetails)>,
+        result: Result<(Vec<PoolSolution>, BundleGasDetails), MatchingEngineError>,
         handles: &mut SharedRoundState<P, Matching, S>
     ) -> bool
     where
         P: Provider + Unpin + 'static,
         Matching: MatchingEngineHandle
     {
-        self.last_round_info = Some(LastRoundInfo {
-            time_to_complete: Instant::now().duration_since(self.trigger_time)
-        });
+        let build_duration = Instant::now().duration_since(self.trigger_time);
+        self.last_round_info = Some(LastRoundInfo { time_to_complete: build_duration });
+
+        // Record proposal build time metric
+        ConsensusMetricsWrapper::new()
+            .set_proposal_build_time(handles.block_height, build_duration.as_millis());
 
         let provider = handles.provider.clone();
         let signer = handles.signer.clone();
@@ -83,33 +123,70 @@ impl ProposalState {
 
         tracing::debug!("starting to build proposal");
 
-        let Ok(possible_bundle) = result.inspect_err(|e| {
-            tracing::error!(err=%e,
-                "Failed to properly build proposal, THERE SHALL BE NO PROPOSAL THIS BLOCK :("
-            )})
+        let Ok(possible_bundle) = result
+            .inspect_err(|e| {
+                tracing::info!(err=%e,
+                    "Failed to properly build proposal, THERE SHALL BE NO PROPOSAL THIS BLOCK :("
+                )
+            })
             .map(|(pool_solution, gas_info)| {
+                // Record matching results metrics
+                let metrics = BlockMetricsWrapper::new();
+                let pools_solved = pool_solution.len();
+
+                let mut filled = 0usize;
+                let mut partial = 0usize;
+                let mut unfilled = 0usize;
+                let mut killed = 0usize;
+
+                for solution in &pool_solution {
+                    for outcome in &solution.limit {
+                        match outcome.outcome {
+                            OrderFillState::CompleteFill => filled += 1,
+                            OrderFillState::PartialFill(_) => partial += 1,
+                            OrderFillState::Unfilled => unfilled += 1,
+                            OrderFillState::Killed => killed += 1
+                        }
+                    }
+                }
 
                 let proposal = Proposal::generate_proposal(
                     handles.block_height,
                     &handles.signer,
                     self.pre_proposal_aggs.clone(),
-                    pool_solution,
+                    pool_solution
                 );
 
                 self.proposal = Some(proposal.clone());
                 let snapshot = handles.fetch_pool_snapshot();
                 let all_orders = handles.order_storage.get_all_orders();
 
-                     AngstromBundle::from_proposal(&proposal,all_orders, gas_info, &snapshot).inspect_err(|e| {
-                        tracing::error!(err=%e,
-                            "failed to encode angstrom bundle, THERE SHALL BE NO PROPOSAL THIS BLOCK :("
-                        );
-                    }).ok()
+                let bundle = AngstromBundle::from_proposal(
+                    &proposal, all_orders, gas_info, &snapshot
+                )
+                .inspect_err(|e| {
+                    tracing::info!(err=%e,
+                        "failed to encode angstrom bundle, THERE SHALL BE NO PROPOSAL THIS BLOCK :("
+                    );
+                })
+                .ok();
 
+                // Record whether bundle was generated
+                metrics.record_matching_results(
+                    self.block_height,
+                    pools_solved,
+                    filled,
+                    partial,
+                    unfilled,
+                    killed,
+                    bundle.is_some()
+                );
 
-            }) else {
-                return false;
-            };
+                bundle
+            })
+        else {
+            return false;
+        };
 
         let attestation = if possible_bundle.is_none() {
             AttestAngstromBlockEmpty::sign_and_encode(target_block, &signer)
@@ -118,35 +195,112 @@ impl ProposalState {
         };
         handles.propagate_message(ConsensusMessage::PropagateEmptyBlockAttestation(attestation));
 
+        // Capture slot clock for metrics timing
+        let slot_clock = handles.slot_clock.clone();
+        let block_height = handles.block_height;
+
         let submission_future = Box::pin(async move {
-            let Ok(tx_hash) = provider
+            // Record submission start
+            let slot_duration = slot_clock.slot_duration();
+            let next_slot = slot_clock.duration_to_next_slot().unwrap_or(slot_duration);
+            let start_offset_ms = slot_duration.saturating_sub(next_slot).as_millis() as u64;
+            let start_time = std::time::Instant::now();
+
+            let metrics = BlockMetricsWrapper::new();
+            metrics.record_submission_started(block_height, start_offset_ms);
+
+            let result = provider
                 .submit_tx(signer, possible_bundle, target_block)
-                .await
-            else {
+                .await;
+
+            let latency_ms = start_time.elapsed().as_millis() as u64;
+            let end_offset_ms = start_offset_ms + latency_ms;
+
+            match &result {
+                Ok(all_results) => {
+                    // Record metrics for EACH endpoint attempt
+                    for submission_result in all_results {
+                        metrics.record_submission_endpoint(
+                            block_height,
+                            &submission_result.submitter_type,
+                            &submission_result.endpoint,
+                            submission_result.success,
+                            submission_result.latency_ms
+                        );
+                    }
+
+                    // Check if any submission succeeded
+                    let any_success = all_results.iter().any(|r| r.success);
+                    metrics.record_submission_completed(
+                        block_height,
+                        end_offset_ms,
+                        latency_ms,
+                        any_success
+                    );
+                }
+                Err(_) => {
+                    metrics.record_submission_completed(
+                        block_height,
+                        end_offset_ms,
+                        latency_ms,
+                        false
+                    );
+                }
+            }
+
+            let Ok(all_results) = result else {
                 tracing::error!("submission failed");
                 return false;
             };
 
-            let Some(tx_hash) = tx_hash else {
-                tracing::info!("submitted unlock attestation");
-                return true;
+            // Find first successful result with a tx_hash
+            let successful_with_hash = all_results
+                .iter()
+                .find(|r| r.success && r.tx_hash.is_some());
+
+            let Some(submission_result) = successful_with_hash else {
+                // Check if any succeeded (attestation-only case)
+                if all_results.iter().any(|r| r.success) {
+                    tracing::info!("submitted unlock attestation");
+                    return true;
+                }
+                tracing::error!("no successful submissions");
+                return false;
             };
 
-            tracing::info!("submitted bundle");
-            provider
-                .watch_blocks()
-                .await
-                .unwrap()
-                .with_poll_interval(Duration::from_millis(10))
-                .into_stream()
-                .next()
-                .await;
+            let tx_hash = submission_result.tx_hash.unwrap();
+
+            tracing::info!(
+                endpoint=%submission_result.endpoint,
+                submitter=%submission_result.submitter_type,
+                "submitted bundle"
+            );
+
+            // Wait for the target block to be produced
+            // We poll until the block exists rather than using watch_blocks()
+            // which can return stale block hashes from its filter buffer
+            loop {
+                match provider.get_block_by_number(target_block.into()).await {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(?e, "error polling for target block");
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+            }
 
             let included = provider
                 .get_transaction_by_hash(tx_hash)
                 .await
                 .unwrap()
                 .is_some();
+
+            // Record bundle inclusion metric
+            metrics.record_bundle_included(block_height, included);
+
             tracing::info!(?included, "block tx result");
             included
         });

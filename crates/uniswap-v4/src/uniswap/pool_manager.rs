@@ -20,6 +20,7 @@ use angstrom_types::{
     contract_payloads::angstrom::TopOfBlockOrder as PayloadTopOfBlockOrder,
     primitive::PoolId,
     sol_bindings::{grouped_orders::OrderWithStorageData, rpc_orders::TopOfBlockOrder},
+    traits::TopOfBlockOrderRewardCalc,
     uni_structure::BaselinePoolState
 };
 use arraydeque::ArrayDeque;
@@ -112,8 +113,6 @@ where
         pool_id: PoolId,
         tob: &OrderWithStorageData<TopOfBlockOrder>
     ) -> eyre::Result<u128> {
-        tracing::info!("calculate_rewards function");
-
         let mut cnt = ATTEMPTS;
         loop {
             let market_snapshot = {
@@ -127,7 +126,6 @@ where
 
             let outcome =
                 PayloadTopOfBlockOrder::calc_vec_and_reward(tob, &market_snapshot).map(|(_, r)| r);
-            tracing::info!(?outcome);
 
             if outcome.is_err() {
                 let zfo = !tob.is_bid;
@@ -397,6 +395,7 @@ where
 }
 
 #[derive(Error, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum PoolManagerError {
     #[error("Invalid block range")]
     InvalidBlockRange,

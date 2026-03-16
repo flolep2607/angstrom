@@ -10,11 +10,11 @@ use alloy::{
     primitives::{Address, B256, BlockNumber, Bytes, FixedBytes},
     providers::Provider
 };
-use angstrom_metrics::ConsensusMetricsWrapper;
+use angstrom_metrics::{BlockMetricsWrapper, ConsensusMetricsWrapper};
 use angstrom_types::{
     consensus::{
         ConsensusRoundEvent, ConsensusRoundName, PreProposal, PreProposalAggregation, Proposal,
-        StromConsensusEvent
+        SlotClock, StromConsensusEvent, SystemTimeSlotClock
     },
     contract_payloads::angstrom::{BundleGasDetails, UniswapAngstromRegistry},
     orders::PoolSolution,
@@ -24,12 +24,12 @@ use angstrom_types::{
 };
 use bid_aggregation::BidAggregationState;
 use futures::{FutureExt, Stream, future::BoxFuture};
-use matching_engine::MatchingEngineHandle;
+use matching_engine::{MatchingEngineHandle, manager::MatchingEngineError};
 use order_pool::order_storage::OrderStorage;
 use preproposal_wait_trigger::{LastRoundInfo, PreProposalWaitTrigger};
 use uniswap_v4::uniswap::pool_manager::SyncedUniswapPools;
 
-use crate::AngstromValidator;
+use crate::{AngstromValidator, ConsensusTimingConfig};
 
 mod bid_aggregation;
 mod finalization;
@@ -37,8 +37,6 @@ mod pre_proposal;
 mod pre_proposal_aggregation;
 mod preproposal_wait_trigger;
 mod proposal;
-
-pub use preproposal_wait_trigger::{MAX_WAIT_DURATION, MIN_WAIT_DURATION};
 
 type PollTransition<P, Matching, S> = Poll<Option<Box<dyn ConsensusState<P, Matching, S>>>>;
 
@@ -78,7 +76,8 @@ where
     /// for consensus, on a new block we wait a duration of time before signing
     /// our pre-proposal. this is the time
     consensus_wait_duration: PreProposalWaitTrigger,
-    shared_state:            SharedRoundState<P, Matching, S>
+    shared_state:            SharedRoundState<P, Matching, S>,
+    slot_clock:              SystemTimeSlotClock
 }
 
 impl<P, Matching, S> RoundStateMachine<P, Matching, S>
@@ -87,16 +86,25 @@ where
     Matching: MatchingEngineHandle,
     S: AngstromMetaSigner
 {
-    pub fn new(shared_state: SharedRoundState<P, Matching, S>) -> Self {
-        let mut consensus_wait_duration =
-            PreProposalWaitTrigger::new(shared_state.order_storage.clone());
+    pub fn new(
+        shared_state: SharedRoundState<P, Matching, S>,
+        slot_clock: SystemTimeSlotClock
+    ) -> Self {
+        let mut consensus_wait_duration = PreProposalWaitTrigger::new(
+            shared_state.order_storage.clone(),
+            shared_state.consensus_config
+        );
+
+        let next_slot_duration = slot_clock.duration_to_next_slot().unwrap();
+        let elapsed_time = slot_clock.slot_duration() - next_slot_duration;
 
         Self {
             current_state: Box::new(BidAggregationState::new(
-                consensus_wait_duration.update_for_new_round(None)
+                consensus_wait_duration.update_for_new_round(None, elapsed_time)
             )),
             consensus_wait_duration,
-            shared_state
+            shared_state,
+            slot_clock
         }
     }
 
@@ -104,7 +112,18 @@ where
         self.shared_state.round_leader
     }
 
+    pub fn timing(&self) -> ConsensusTimingConfig {
+        self.shared_state.consensus_config
+    }
+
+    pub fn is_auction_closed(&self) -> bool {
+        self.current_state.name().is_closed()
+    }
+
     pub fn reset_round(&mut self, new_block: u64, new_leader: Address) {
+        let next_slot_duration = self.slot_clock.duration_to_next_slot().unwrap();
+        let elapsed_time = self.slot_clock.slot_duration() - next_slot_duration;
+
         // grab the last round info if we were the leader.
         let info = self.current_state.last_round_info();
 
@@ -119,7 +138,8 @@ where
         self.shared_state.round_leader = new_leader;
 
         self.current_state = Box::new(BidAggregationState::new(
-            self.consensus_wait_duration.update_for_new_round(info)
+            self.consensus_wait_duration
+                .update_for_new_round(info, elapsed_time)
         ));
     }
 
@@ -159,17 +179,19 @@ where
 }
 
 pub struct SharedRoundState<P: Provider + Unpin + 'static, Matching, S: AngstromMetaSigner> {
-    block_height:    BlockNumber,
-    matching_engine: Matching,
-    signer:          AngstromSigner<S>,
-    round_leader:    Address,
-    validators:      Vec<AngstromValidator>,
-    order_storage:   Arc<OrderStorage>,
-    _metrics:        ConsensusMetricsWrapper,
-    pool_registry:   UniswapAngstromRegistry,
-    uniswap_pools:   SyncedUniswapPools,
-    provider:        Arc<SubmissionHandler<P>>,
-    messages:        VecDeque<ConsensusMessage>
+    block_height:     BlockNumber,
+    matching_engine:  Matching,
+    signer:           AngstromSigner<S>,
+    round_leader:     Address,
+    validators:       Vec<AngstromValidator>,
+    order_storage:    Arc<OrderStorage>,
+    _metrics:         ConsensusMetricsWrapper,
+    pool_registry:    UniswapAngstromRegistry,
+    uniswap_pools:    SyncedUniswapPools,
+    provider:         Arc<SubmissionHandler<P>>,
+    messages:         VecDeque<ConsensusMessage>,
+    consensus_config: ConsensusTimingConfig,
+    slot_clock:       SystemTimeSlotClock
 }
 
 // contains shared impls
@@ -190,7 +212,9 @@ where
         pool_registry: UniswapAngstromRegistry,
         uniswap_pools: SyncedUniswapPools,
         provider: SubmissionHandler<P>,
-        matching_engine: Matching
+        matching_engine: Matching,
+        consensus_config: ConsensusTimingConfig,
+        slot_clock: SystemTimeSlotClock
     ) -> Self {
         Self {
             block_height,
@@ -203,8 +227,21 @@ where
             _metrics: metrics,
             matching_engine,
             messages: VecDeque::new(),
-            provider: Arc::new(provider)
+            provider: Arc::new(provider),
+            consensus_config,
+            slot_clock
         }
+    }
+
+    /// Get the current slot offset in milliseconds
+    pub fn slot_offset_ms(&self) -> u64 {
+        let slot_duration = self.slot_clock.slot_duration();
+        let next_slot_duration = self
+            .slot_clock
+            .duration_to_next_slot()
+            .unwrap_or(slot_duration);
+        let elapsed = slot_duration.saturating_sub(next_slot_duration);
+        elapsed.as_millis() as u64
     }
 
     fn propagate_message(&mut self, message: ConsensusMessage) {
@@ -240,7 +277,8 @@ where
     fn matching_engine_output(
         &self,
         pre_proposal_aggregation: HashSet<PreProposalAggregation>
-    ) -> BoxFuture<'static, eyre::Result<(Vec<PoolSolution>, BundleGasDetails)>> {
+    ) -> BoxFuture<'static, Result<(Vec<PoolSolution>, BundleGasDetails), MatchingEngineError>>
+    {
         // fetch
         let mut limit = Vec::new();
         let mut searcher = Vec::new();
@@ -254,7 +292,17 @@ where
 
         let valid_limit = self.filter_quorum_orders(limit);
         let valid_searcher = self.filter_quorum_orders(searcher);
-        let orders = self.order_storage.get_all_orders();
+
+        // Record post-quorum order counts
+        BlockMetricsWrapper::new().record_matching_input_post_quorum(
+            self.block_height,
+            valid_limit.len(),
+            valid_searcher.len()
+        );
+
+        let orders = self
+            .order_storage
+            .get_all_orders_with_ingoing_cancellations();
 
         let (limit, searcher) = orders.into_book_and_searcher(valid_limit, valid_searcher);
 
@@ -483,7 +531,10 @@ pub mod tests {
     };
     use angstrom_metrics::ConsensusMetricsWrapper;
     use angstrom_types::{
-        consensus::StromConsensusEvent,
+        consensus::{
+            StromConsensusEvent,
+            slot_clock::{SlotClock, SystemTimeSlotClock}
+        },
         contract_payloads::angstrom::{AngstromPoolConfigStore, UniswapAngstromRegistry},
         primitive::{AngstromSigner, UniswapPoolRegistry},
         submission::SubmissionHandler
@@ -504,7 +555,7 @@ pub mod tests {
         ConsensusMessage, RoundStateMachine, SharedRoundState, pre_proposal::PreProposalState
     };
     use crate::{
-        AngstromValidator,
+        AngstromValidator, ConsensusTimingConfig,
         rounds::{ConsensusState, pre_proposal_aggregation::PreProposalAggregationState}
     };
 
@@ -558,6 +609,7 @@ pub mod tests {
         let provider =
             SubmissionHandler { node_provider: querying_provider, submitters: vec![] };
 
+        let slot_clock = SystemTimeSlotClock::new_with_chain_id(1).unwrap();
         let shared_state = SharedRoundState::new(
             1, // block height
             order_storage,
@@ -568,9 +620,11 @@ pub mod tests {
             pool_registry,
             uniswap_pools,
             provider,
-            MockMatchingEngine {}
+            MockMatchingEngine {},
+            ConsensusTimingConfig::default(),
+            slot_clock.clone()
         );
-        RoundStateMachine::new(shared_state)
+        RoundStateMachine::new(shared_state, slot_clock)
     }
 
     #[tokio::test]

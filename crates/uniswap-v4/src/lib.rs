@@ -1,9 +1,13 @@
-use std::{collections::HashSet, pin::Pin, sync::Arc};
+use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 pub const DEFAULT_TICKS: u16 = 400;
 
 use alloy::{
-    consensus::TxReceipt, primitives::aliases::I24, providers::Provider, sol_types::SolEvent
+    consensus::TxReceipt,
+    eips::{BlockId, BlockNumberOrTag},
+    primitives::aliases::{I24, U24},
+    providers::Provider,
+    sol_types::SolEvent
 };
 use alloy_primitives::{Address, BlockNumber, FixedBytes};
 use angstrom_eth::manager::EthEvent;
@@ -18,8 +22,7 @@ use angstrom_types::{
 use futures::Stream;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use reth_provider::{
-    CanonStateNotifications, DatabaseProviderFactory, ReceiptProvider, StateProvider,
-    TryIntoHistoricalStateProvider
+    CanonStateNotifications, ReceiptProvider, StateProvider, StateProviderFactory
 };
 use uniswap::pool_factory::V4PoolFactory;
 
@@ -50,16 +53,13 @@ pub async fn fetch_angstrom_pools<DB>(
     db: &DB
 ) -> Vec<PoolKey>
 where
-    DB: DatabaseProviderFactory + ReceiptProvider,
-    <DB as DatabaseProviderFactory>::Provider: TryIntoHistoricalStateProvider
+    DB: StateProviderFactory + ReceiptProvider
 {
     let logs = (deploy_block..=end_block)
         .into_par_iter()
         .flat_map(|block| {
             let storage_provider = db
-                .database_provider_ro()
-                .unwrap()
-                .try_into_history_at_block(block as u64)
+                .state_by_block_id(BlockId::Number(BlockNumberOrTag::Number(block as u64)))
                 .unwrap();
 
             let controller_addr = Address::from_word(FixedBytes::new(
@@ -81,7 +81,7 @@ where
         .collect::<Vec<_>>();
 
     logs.into_iter()
-        .fold(HashSet::new(), |mut set, log| {
+        .fold(HashMap::new(), |mut set, log| {
             if let Ok(pool) = PoolConfigured::decode_log(&log) {
                 let pool_key = PoolKey {
                     currency0:   pool.asset0,
@@ -96,8 +96,10 @@ where
                     .unwrap(),
                     hooks:       angstrom_address
                 };
+                let mut copy = pool_key;
+                copy.fee = U24::ZERO;
 
-                set.insert(pool_key);
+                set.insert(copy, pool_key);
                 return set;
             }
 
@@ -105,7 +107,7 @@ where
                 let pool_key = PoolKey {
                     currency0:   pool.asset0,
                     currency1:   pool.asset1,
-                    fee:         pool.feeInE6,
+                    fee:         U24::ZERO,
                     tickSpacing: pool.tickSpacing,
                     hooks:       angstrom_address
                 };
@@ -115,7 +117,7 @@ where
             }
             set
         })
-        .into_iter()
+        .into_values()
         .collect::<Vec<_>>()
 }
 
@@ -544,7 +546,7 @@ pub mod fuzz_uniswap {
     }
 
     /// initializes the new uniswap pools on most recent sepolia block
-    async fn init_uniswap_pools<P: Provider, DB: DatabaseRef>(
+    async fn init_uniswap_pools<P: Provider<N>, N: alloy::network::Network, DB: DatabaseRef>(
         provider: &P,
         db: &mut CacheDB<Arc<DB>>
     ) -> (u64, Vec<EnhancedUniswapPool>) {

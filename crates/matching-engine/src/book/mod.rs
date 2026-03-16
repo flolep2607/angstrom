@@ -2,10 +2,9 @@
 use std::{iter::Chain, slice::Iter};
 
 use angstrom_types::{
-    matching::SqrtPriceX96,
-    primitive::PoolId,
+    primitive::{PoolId, Ray, SqrtPriceX96},
     sol_bindings::{
-        RawPoolOrder, Ray,
+        RawPoolOrder,
         grouped_orders::{AllOrders, OrderWithStorageData}
     },
     uni_structure::BaselinePoolState
@@ -60,7 +59,8 @@ impl OrderBook {
     /// Bids first, then asks.
     pub fn all_orders_iter(
         &self
-    ) -> Chain<Iter<OrderWithStorageData<AllOrders>>, Iter<OrderWithStorageData<AllOrders>>> {
+    ) -> Chain<Iter<'_, OrderWithStorageData<AllOrders>>, Iter<'_, OrderWithStorageData<AllOrders>>>
+    {
         self.bids.iter().chain(self.asks.iter())
     }
 

@@ -4,17 +4,14 @@ use alloy_primitives::{
 };
 use angstrom_types::{
     contract_bindings::angstrom::Angstrom::PoolKey,
-    matching::{
-        SqrtPriceX96,
-        uniswap::{LiqRange, PoolPrice, PoolSnapshot}
-    },
-    primitive::PoolId,
-    sol_bindings::grouped_orders::{GroupedVanillaOrder, OrderWithStorageData}
+    matching::uniswap::{LiqRange, PoolPrice, PoolSnapshot},
+    primitive::{PoolId, SqrtPriceX96},
+    sol_bindings::grouped_orders::{AllOrders, OrderWithStorageData}
 };
 
 #[derive(Debug)]
 pub enum OrderType {
-    FixedOrders(Vec<OrderWithStorageData<GroupedVanillaOrder>>),
+    FixedOrders(Vec<OrderWithStorageData<AllOrders>>),
     GeneratedOrders(usize)
 }
 
@@ -36,7 +33,7 @@ impl Pool {
         Self { key, snapshot, tob }
     }
 
-    pub fn price(&self) -> PoolPrice {
+    pub fn price(&self) -> PoolPrice<'_> {
         self.snapshot.current_price(true)
     }
 

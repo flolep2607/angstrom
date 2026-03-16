@@ -1,16 +1,15 @@
 use alloy::{
     eips::Encodable2718,
-    network::TransactionBuilder,
     providers::{Provider, ProviderBuilder, RootProvider}
 };
-use alloy_primitives::{Address, TxHash};
+use alloy_primitives::Address;
 use futures::stream::{StreamExt, iter};
 
 use super::{
-    AngstromBundle, AngstromSigner, ChainSubmitter, DEFAULT_SUBMISSION_CONCURRENCY, TxFeatureInfo,
-    Url
+    AngstromBundle, AngstromSigner, ChainSubmitter, DEFAULT_SUBMISSION_CONCURRENCY,
+    SubmissionResult, TxFeatureInfo, Url
 };
-use crate::{primitive::AngstromMetaSigner, submission::EXTRA_GAS_LIMIT};
+use crate::primitive::AngstromMetaSigner;
 
 /// handles submitting transaction to
 pub struct MempoolSubmitter {
@@ -35,54 +34,63 @@ impl ChainSubmitter for MempoolSubmitter {
         self.angstrom_address
     }
 
+    fn submitter_type(&self) -> &'static str {
+        "mempool"
+    }
+
     fn submit<'a, S: AngstromMetaSigner>(
         &'a self,
         signer: &'a AngstromSigner<S>,
         bundle: Option<&'a AngstromBundle>,
         tx_features: &'a TxFeatureInfo
-    ) -> std::pin::Pin<Box<dyn Future<Output = eyre::Result<Option<TxHash>>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn Future<Output = eyre::Result<Vec<SubmissionResult>>> + Send + 'a>>
+    {
         Box::pin(async move {
-            let bundle = bundle.ok_or_else(|| eyre::eyre!("no bundle was past in"))?;
-
-            let client = self
-                .clients
-                .first()
-                .ok_or(eyre::eyre!("no mempool clients found"))?
-                .0
-                .clone();
+            let bundle = match bundle {
+                Some(b) => b,
+                None => return Ok(Vec::new()) // No bundle means no mempool submission
+            };
 
             let tx = self
-                .build_and_sign_tx_with_gas(signer, bundle, tx_features, |tx| async move {
-                    let gas = client
-                        .estimate_gas(tx.clone())
-                        .await
-                        .inspect_err(|e| {
-                            tracing::error!(err=%e, "failed to query gas");
-                        })
-                        .unwrap_or(bundle.crude_gas_estimation())
-                        + EXTRA_GAS_LIMIT;
-                    tx.with_gas_limit(gas)
-                })
+                .build_and_sign_tx_with_gas(signer, bundle, tx_features)
                 .await;
 
             let encoded_tx = tx.encoded_2718();
             let tx_hash = *tx.tx_hash();
 
-            // Clone here is fine as its in a Arc
-            let _: Vec<_> = iter(self.clients.clone())
+            // Submit to all endpoints and collect per-endpoint timing
+            let results: Vec<_> = iter(self.clients.clone())
                 .map(async |(client, url)| {
-                    client
+                    let endpoint_start = std::time::Instant::now();
+                    let result = client
                         .send_raw_transaction(&encoded_tx)
                         .await
                         .inspect_err(|e| {
-                            tracing::warn!(url=?url, err=?e, "failed to send mempool tx");
-                        })
+                            tracing::info!(url=%url.as_str(), err=%e, "failed to send mempool tx");
+                        });
+                    let endpoint_latency = endpoint_start.elapsed().as_millis() as u64;
+                    (url, result, endpoint_latency)
                 })
                 .buffer_unordered(DEFAULT_SUBMISSION_CONCURRENCY)
                 .collect::<Vec<_>>()
                 .await;
 
-            Ok(Some(tx_hash))
+            // Convert all results to SubmissionResult
+            let submission_results: Vec<SubmissionResult> = results
+                .into_iter()
+                .map(|(url, result, endpoint_latency)| {
+                    let success = result.is_ok();
+                    SubmissionResult {
+                        tx_hash: if success { Some(tx_hash) } else { None },
+                        submitter_type: "mempool".to_string(),
+                        endpoint: url.to_string(),
+                        success,
+                        latency_ms: endpoint_latency
+                    }
+                })
+                .collect();
+
+            Ok(submission_results)
         })
     }
 }

@@ -23,19 +23,38 @@ use reqwest::Url;
 use crate::{
     contract_bindings::angstrom::Angstrom,
     contract_payloads::angstrom::AngstromBundle,
-    primitive::{AngstromMetaSigner, AngstromSigner}
+    primitive::{ANGSTROM_ADDRESS, AngstromMetaSigner, AngstromSigner, CHAIN_ID},
+    submission::Angstrom::unlockWithEmptyAttestationCall
 };
 
-pub(super) const EXTRA_GAS: u128 = 1e9 as u128;
 const DEFAULT_SUBMISSION_CONCURRENCY: usize = 10;
 
 pub(super) const EXTRA_GAS_LIMIT: u64 = 100_000;
 
+type BundleGasFuture = Pin<Box<dyn Future<Output = u64> + Send>>;
+type BundleGasEstimator = dyn Fn(TransactionRequest) -> BundleGasFuture + Send + Sync;
+
+/// Result of an individual endpoint submission attempt
+#[derive(Debug, Clone)]
+pub struct SubmissionResult {
+    /// The transaction hash if a bundle was submitted (only set on success)
+    pub tx_hash:        Option<TxHash>,
+    /// Type of submitter (e.g., "mempool", "angstrom", "mev_boost")
+    pub submitter_type: String,
+    /// The endpoint URL
+    pub endpoint:       String,
+    /// Whether this endpoint succeeded
+    pub success:        bool,
+    /// Time taken for the submission in milliseconds
+    pub latency_ms:     u64
+}
+
 pub struct TxFeatureInfo {
-    pub nonce:        u64,
-    pub fees:         Eip1559Estimation,
-    pub chain_id:     u64,
-    pub target_block: u64
+    pub nonce:           u64,
+    pub fees:            Eip1559Estimation,
+    pub chain_id:        u64,
+    pub target_block:    u64,
+    pub bundle_gas_used: Box<BundleGasEstimator>
 }
 
 /// a chain submitter is a trait that deals with submitting a bundle to the
@@ -43,12 +62,16 @@ pub struct TxFeatureInfo {
 pub trait ChainSubmitter: Send + Sync + Unpin + 'static {
     fn angstrom_address(&self) -> Address;
 
+    /// Returns the submitter type name for metrics
+    fn submitter_type(&self) -> &'static str;
+
+    /// Submit to all endpoints and return results for each one
     fn submit<'a, S: AngstromMetaSigner>(
         &'a self,
         signer: &'a AngstromSigner<S>,
         bundle: Option<&'a AngstromBundle>,
         tx_features: &'a TxFeatureInfo
-    ) -> Pin<Box<dyn Future<Output = eyre::Result<Option<TxHash>>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = eyre::Result<Vec<SubmissionResult>>> + Send + 'a>>;
 
     fn build_tx<S: AngstromMetaSigner>(
         &self,
@@ -63,23 +86,49 @@ pub trait ChainSubmitter: Send + Sync + Unpin + 'static {
             .with_input(encoded)
             .with_chain_id(tx_features.chain_id)
             .with_nonce(tx_features.nonce)
-            .with_max_fee_per_gas(tx_features.fees.max_fee_per_gas + EXTRA_GAS)
-            .with_max_priority_fee_per_gas(tx_features.fees.max_priority_fee_per_gas + EXTRA_GAS)
+            .with_max_fee_per_gas(tx_features.fees.max_fee_per_gas)
+            .with_max_priority_fee_per_gas(tx_features.fees.max_priority_fee_per_gas)
     }
 
-    fn build_and_sign_tx_with_gas<'a, S: AngstromMetaSigner, F>(
+    fn build_and_sign_unlock<'a, S: AngstromMetaSigner>(
+        &'a self,
+        signer: &'a AngstromSigner<S>,
+        sig: Vec<u8>,
+        tx_features: &'a TxFeatureInfo
+    ) -> Pin<Box<dyn Future<Output = EthereumTxEnvelope<TxEip4844Variant>> + Send + 'a>> {
+        Box::pin(async move {
+            let unlock_call = unlockWithEmptyAttestationCall {
+                node:      signer.address(),
+                signature: sig.into()
+            };
+            // getting invalid signature
+            alloy::rpc::types::TransactionRequest::default()
+                .to(*ANGSTROM_ADDRESS.get().unwrap())
+                .with_from(signer.address())
+                .with_input(unlock_call.abi_encode())
+                .with_chain_id(*CHAIN_ID.get().unwrap())
+                .with_nonce(tx_features.nonce)
+                .gas_limit(100_000)
+                .with_max_fee_per_gas(tx_features.fees.max_fee_per_gas)
+                // We can put zero here as this is only for angstrom integrators.
+                .with_max_priority_fee_per_gas(0)
+                .build(&signer)
+                .await
+                .unwrap()
+        })
+    }
+
+    fn build_and_sign_tx_with_gas<'a, S: AngstromMetaSigner>(
         &'a self,
         signer: &'a AngstromSigner<S>,
         bundle: &'a AngstromBundle,
-        tx_features: &'a TxFeatureInfo,
-        gas: impl FnOnce(TransactionRequest) -> F + Send + Sync + 'a
-    ) -> Pin<Box<dyn Future<Output = EthereumTxEnvelope<TxEip4844Variant>> + Send + 'a>>
-    where
-        F: Future<Output = TransactionRequest> + Send + 'a
-    {
+        tx_features: &'a TxFeatureInfo
+    ) -> Pin<Box<dyn Future<Output = EthereumTxEnvelope<TxEip4844Variant>> + Send + 'a>> {
         Box::pin(async move {
-            gas(self.build_tx(signer, bundle, tx_features))
-                .await
+            let tx = self.build_tx(signer, bundle, tx_features);
+            let gas = (tx_features.bundle_gas_used)(tx.clone()).await;
+
+            tx.gas_limit(gas + EXTRA_GAS_LIMIT)
                 .build(signer)
                 .await
                 .unwrap()
@@ -127,19 +176,20 @@ where
             signer.clone()
         )) as Box<dyn ChainSubmitterWrapper>;
         let mev_boost = Box::new(ChainSubmitterHolder::new(
-            MevBoostSubmitter::new(mev_boost, angstom_address),
+            MevBoostSubmitter::new(mev_boost, signer.clone(), angstom_address),
             signer
         )) as Box<dyn ChainSubmitterWrapper>;
 
         Self { node_provider, submitters: vec![mempool, angstrom, mev_boost] }
     }
 
+    /// Submit to all configured endpoints and return all results
     pub async fn submit_tx<S: AngstromMetaSigner>(
         &self,
         signer: AngstromSigner<S>,
         bundle: Option<AngstromBundle>,
         target_block: u64
-    ) -> eyre::Result<Option<TxHash>> {
+    ) -> eyre::Result<Vec<SubmissionResult>> {
         let from = signer.address();
         let nonce = self
             .node_provider
@@ -150,7 +200,19 @@ where
         let fees = self.node_provider.estimate_eip1559_fees().await?;
         let chain_id = self.node_provider.get_chain_id().await?;
 
-        let tx_features = TxFeatureInfo { nonce, fees, chain_id, target_block };
+        let node_provider = self.node_provider.clone();
+        let tx_features = TxFeatureInfo {
+            nonce,
+            fees,
+            chain_id,
+            target_block,
+            bundle_gas_used: Box::new(move |tx| {
+                let node_provider = node_provider.clone();
+                Box::pin(
+                    async move { node_provider.estimate_gas(tx).await.unwrap() + EXTRA_GAS_LIMIT }
+                )
+            })
+        };
 
         let mut futs = Vec::new();
         for submitter in &self.submitters {
@@ -158,17 +220,15 @@ where
         }
         let mut buffered_futs = futures::stream::iter(futs).buffer_unordered(10);
 
-        let mut tx_hash = None;
-        // We log out errors at the lower level so no need to expand them here.
+        let mut all_results = Vec::new();
+        // Collect all results from all submitters
         while let Some(res) = buffered_futs.next().await {
-            let res = res.inspect_err(|e| tracing::warn!(?e));
-
-            if let Ok(Some(res)) = res {
-                tx_hash = Some(res);
+            if let Ok(results) = res {
+                all_results.extend(results);
             }
         }
 
-        Ok(tx_hash)
+        Ok(all_results)
     }
 }
 
@@ -187,7 +247,7 @@ pub trait ChainSubmitterWrapper: Send + Sync + Unpin + 'static {
         &'a self,
         bundle: Option<&'a AngstromBundle>,
         tx_features: &'a TxFeatureInfo
-    ) -> Pin<Box<dyn Future<Output = eyre::Result<Option<TxHash>>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = eyre::Result<Vec<SubmissionResult>>> + Send + 'a>>;
 }
 
 impl<I: ChainSubmitter, S: AngstromMetaSigner + 'static> ChainSubmitterWrapper
@@ -201,7 +261,7 @@ impl<I: ChainSubmitter, S: AngstromMetaSigner + 'static> ChainSubmitterWrapper
         &'a self,
         bundle: Option<&'a AngstromBundle>,
         tx_features: &'a TxFeatureInfo
-    ) -> Pin<Box<dyn Future<Output = eyre::Result<Option<TxHash>>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = eyre::Result<Vec<SubmissionResult>>> + Send + 'a>> {
         self.0.submit(&self.1, bundle, tx_features)
     }
 }

@@ -9,8 +9,8 @@ use std::{
 use alloy::primitives::{B256, BlockNumber, FixedBytes};
 use angstrom_metrics::OrderStorageMetricsWrapper;
 use angstrom_types::{
-    orders::{OrderId, OrderLocation, OrderSet, OrderStatus, UpdatedGas},
-    primitive::{NewInitializedPool, PoolId},
+    orders::{OrderId, OrderSet, UpdatedGas},
+    primitive::{NewInitializedPool, OrderLocation, OrderStatus, PoolId},
     sol_bindings::{
         grouped_orders::{AllOrders, OrderWithStorageData},
         rpc_orders::TopOfBlockOrder
@@ -43,14 +43,8 @@ pub struct OrderStorage {
 
 impl OrderStorage {
     pub fn new(config: &PoolConfig) -> Self {
-        let limit_orders = Arc::new(Mutex::new(LimitOrderPool::new(
-            &config.ids,
-            Some(config.lo_pending_limit.max_size)
-        )));
-        let searcher_orders = Arc::new(Mutex::new(SearcherPool::new(
-            &config.ids,
-            Some(config.s_pending_limit.max_size)
-        )));
+        let limit_orders = Arc::new(Mutex::new(LimitOrderPool::new(&config.ids)));
+        let searcher_orders = Arc::new(Mutex::new(SearcherPool::new(&config.ids)));
 
         let pending_finalization_orders = Arc::new(Mutex::new(FinalizationPool::new()));
 
@@ -75,7 +69,7 @@ impl OrderStorage {
             pending_finalization_orders,
             searcher_orders,
             filled_orders,
-            metrics: OrderStorageMetricsWrapper::empty()
+            metrics: OrderStorageMetricsWrapper::new()
         }
     }
 
@@ -190,40 +184,41 @@ impl OrderStorage {
         }
     }
 
-    pub fn cancel_order(&self, order_id: &OrderId) -> Option<OrderWithStorageData<AllOrders>> {
+    pub fn purge_tob_orders(&self) -> Vec<OrderWithStorageData<TopOfBlockOrder>> {
+        self.searcher_orders
+            .lock()
+            .expect("lock poisoned")
+            .remove_all_cancelled_orders()
+    }
+
+    pub fn purge_user_orders(&self) -> Vec<OrderWithStorageData<AllOrders>> {
+        self.limit_orders
+            .lock()
+            .expect("lock poisoned")
+            .remove_all_cancelled_orders()
+    }
+
+    pub fn cancel_order(&self, order_id: &OrderId) -> bool {
         if self
             .pending_finalization_orders
             .lock()
             .expect("poisoned")
             .has_order(&order_id.hash)
         {
-            return None;
+            return true;
         }
 
         match order_id.location {
-            angstrom_types::orders::OrderLocation::Limit => self
+            angstrom_types::primitive::OrderLocation::Limit => self
                 .limit_orders
                 .lock()
                 .expect("lock poisoned")
-                .remove_order(order_id)
-                .inspect(|order| {
-                    if order.is_vanilla() {
-                        self.metrics.incr_cancelled_vanilla_orders()
-                    } else {
-                        self.metrics.incr_cancelled_composable_orders()
-                    }
-                }),
-            angstrom_types::orders::OrderLocation::Searcher => self
+                .cancel_order(order_id),
+            angstrom_types::primitive::OrderLocation::Searcher => self
                 .searcher_orders
                 .lock()
                 .expect("lock poisoned")
-                .remove_order(order_id)
-                .map(|order| {
-                    self.metrics.incr_cancelled_searcher_orders();
-                    order
-                        .try_map_inner(|inner| Ok(AllOrders::TOB(inner)))
-                        .unwrap()
-                })
+                .cancel_order(order_id)
         }
     }
 
@@ -234,13 +229,25 @@ impl OrderStorage {
         order_info
             .into_iter()
             .for_each(|order| match order.location {
-                angstrom_types::orders::OrderLocation::Limit => {
+                angstrom_types::primitive::OrderLocation::Limit => {
                     limit_lock.park_order(order);
                 }
-                angstrom_types::orders::OrderLocation::Searcher => {
+                angstrom_types::primitive::OrderLocation::Searcher => {
                     tracing::debug!("tried to park searcher order. this is not supported");
                 }
             });
+    }
+
+    pub fn all_top_tob_orders(&self) -> Vec<OrderWithStorageData<TopOfBlockOrder>> {
+        let searcher_orders = self.searcher_orders.lock().expect("lock poisoned");
+        searcher_orders
+            .get_all_pool_ids()
+            .flat_map(|pool_id| {
+                searcher_orders
+                    .get_orders_for_pool_including_canceled(&pool_id)
+                    .unwrap_or_else(|| panic!("pool {pool_id} does not exist"))
+            })
+            .collect()
     }
 
     pub fn top_tob_orders(&self) -> Vec<OrderWithStorageData<TopOfBlockOrder>> {
@@ -392,6 +399,21 @@ impl OrderStorage {
                     self.metrics.decr_composable_limit_orders(1);
                 }
             })
+    }
+
+    pub fn get_all_orders_with_ingoing_cancellations(
+        &self
+    ) -> OrderSet<AllOrders, TopOfBlockOrder> {
+        // Given that this is used for generating the proposal, we also
+        // don't wanna ignore newly blocked orders.
+        let limit = self
+            .limit_orders
+            .lock()
+            .expect("poisoned")
+            .get_all_orders_with_parked_and_cancelled();
+        let searcher = self.all_top_tob_orders();
+
+        OrderSet { limit, searcher }
     }
 
     pub fn get_all_orders(&self) -> OrderSet<AllOrders, TopOfBlockOrder> {

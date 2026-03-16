@@ -10,8 +10,10 @@ use alloy::primitives::{Address, B256, FixedBytes};
 use angstrom_eth::manager::EthEvent;
 use angstrom_types::{
     block_sync::BlockSyncConsumer,
-    orders::{CancelOrderRequest, OrderLocation, OrderOrigin, OrderStatus},
-    primitive::{NewInitializedPool, OrderValidationError, PeerId, PoolId},
+    orders::{CancelOrderRequest, OrderOrigin},
+    primitive::{
+        NewInitializedPool, OrderLocation, OrderStatus, OrderValidationError, PeerId, PoolId
+    },
     sol_bindings::grouped_orders::AllOrders
 };
 use futures::{Future, FutureExt, StreamExt};
@@ -51,6 +53,7 @@ pub enum OrderCommand {
 }
 
 impl PoolHandle {
+    #[allow(clippy::result_large_err)]
     fn send(&self, cmd: OrderCommand) -> Result<(), SendError<OrderCommand>> {
         self.manager_tx.send(cmd)
     }
@@ -196,7 +199,7 @@ where
         replay(&mut inner);
         self.global_sync.register(MODULE_NAME);
 
-        task_spawner.spawn_critical(
+        task_spawner.spawn_critical_task(
             "transaction manager",
             Box::pin(PoolManager {
                 eth_network_events:   self.eth_network_events,

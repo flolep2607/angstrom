@@ -14,7 +14,7 @@ use alloy::{
     providers::{Provider, ProviderBuilder, network::Ethereum}
 };
 use alloy_chains::Chain;
-use angstrom_amm_quoter::{QuoterManager, Slot0Update};
+use angstrom_amm_quoter::QuoterManager;
 use angstrom_eth::{
     handle::{Eth, EthCommand},
     manager::{EthDataCleanser, EthEvent}
@@ -26,12 +26,12 @@ use angstrom_network::{
 };
 use angstrom_types::{
     block_sync::{BlockSyncProducer, GlobalBlockSync},
-    consensus::StromConsensusEvent,
+    consensus::{SlotClock, StromConsensusEvent, SystemTimeSlotClock},
     contract_payloads::angstrom::{AngstromPoolConfigStore, UniswapAngstromRegistry},
     pair_with_price::PairsWithPrice,
     primitive::{
         ANGSTROM_ADDRESS, ANGSTROM_DEPLOYED_BLOCK, AngstromMetaSigner, AngstromSigner,
-        CONTROLLER_V1_ADDRESS, GAS_TOKEN_ADDRESS, POOL_MANAGER_ADDRESS, PoolId,
+        CONTROLLER_V1_ADDRESS, GAS_TOKEN_ADDRESS, POOL_MANAGER_ADDRESS, PoolId, Slot0Update,
         UniswapPoolRegistry
     },
     reth_db_provider::RethDbLayer,
@@ -56,7 +56,7 @@ use reth_metrics::common::mpsc::{UnboundedMeteredReceiver, UnboundedMeteredSende
 use reth_network::{NetworkHandle, Peers};
 use reth_node_builder::{FullNode, NodeTypes, node::FullNodeTypes, rpc::RethRpcAddOns};
 use reth_provider::{
-    BlockReader, DatabaseProviderFactory, ReceiptProvider, TryIntoHistoricalStateProvider
+    BlockReader, DatabaseProviderFactory, StateProviderFactory, TryIntoHistoricalStateProvider
 };
 use telemetry::init_telemetry;
 use tokio::sync::{
@@ -192,13 +192,18 @@ where
             Block = reth::primitives::Block,
             Receipt = reth::primitives::Receipt,
             Header = reth::primitives::Header
-        > + DatabaseProviderFactory,
+        > + DatabaseProviderFactory
+        + StateProviderFactory
+        + BlockNumReader
+        + Clone,
     AddOns: NodeAddOns<Node> + RethRpcAddOns<Node>,
     <<Node as FullNodeTypes>::Provider as DatabaseProviderFactory>::Provider:
-        TryIntoHistoricalStateProvider + ReceiptProvider,
-    <<Node as FullNodeTypes>::Provider as DatabaseProviderFactory>::Provider: BlockNumReader,
+        TryIntoHistoricalStateProvider + BlockNumReader,
     S: AngstromMetaSigner
 {
+    // Check to assert that the timeing config is valid.
+    assert!(config.consensus_timing.is_valid(), "consensus timing config is invalid");
+
     let node_address = signer.address();
 
     // NOTE:
@@ -351,7 +356,7 @@ where
     let uniswap_pools = uniswap_pool_manager.pools();
     let pool_ids = uniswap_pool_manager.pool_addresses().collect::<Vec<_>>();
 
-    executor.spawn_critical("uniswap pool manager", Box::pin(uniswap_pool_manager));
+    executor.spawn_critical_task("uniswap pool manager", Box::pin(uniswap_pool_manager));
     let price_generator = TokenPriceGenerator::new(
         querying_provider.clone(),
         block_id,
@@ -436,7 +441,7 @@ where
         consensus_client.subscribe_consensus_round_event()
     );
 
-    executor.spawn_critical("amm quoting service", amm);
+    executor.spawn_critical_task("amm quoting service", amm);
 
     let manager = ConsensusManager::new(
         ManagerNetworkDeps::new(
@@ -455,7 +460,9 @@ where
         matching_handle,
         global_block_sync.clone(),
         handles.consensus_rx_rpc,
-        None
+        None,
+        config.consensus_timing,
+        SystemTimeSlotClock::new_default().unwrap()
     );
 
     executor.spawn_critical_with_graceful_shutdown_signal("consensus", move |grace| {

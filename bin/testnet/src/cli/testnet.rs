@@ -11,7 +11,7 @@ use alloy_primitives::{
 };
 use alloy_signer_local::LocalSigner;
 use angstrom_metrics::{METRICS_ENABLED, initialize_prometheus_metrics};
-use angstrom_types::{contract_bindings::angstrom::Angstrom::PoolKey, matching::SqrtPriceX96};
+use angstrom_types::{contract_bindings::angstrom::Angstrom::PoolKey, primitive::SqrtPriceX96};
 use consensus::AngstromValidator;
 use enr::k256::ecdsa::SigningKey;
 use eyre::Context;
@@ -46,7 +46,7 @@ pub struct TestnetCli {
 }
 
 impl TestnetCli {
-    pub(crate) fn make_config(&self) -> eyre::Result<TestnetConfig> {
+    pub fn make_config(&self) -> eyre::Result<TestnetConfig> {
         let initial_state_config = AllPoolKeyInners::load_toml_config(&self.pool_key_config)?;
 
         Ok(TestnetConfig::new(

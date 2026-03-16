@@ -4,6 +4,7 @@ use std::{
     sync::Arc
 };
 
+use alloy::hex;
 use alloy_primitives::Address;
 use angstrom_types::{
     contract_payloads::angstrom::{AngstromBundle, BundleGasDetails},
@@ -11,6 +12,7 @@ use angstrom_types::{
     orders::PoolSolution,
     primitive::PoolId,
     sol_bindings::{grouped_orders::OrderWithStorageData, rpc_orders::TopOfBlockOrder},
+    traits::BundleProcessing,
     uni_structure::BaselinePoolState
 };
 use futures::{Future, stream::FuturesUnordered};
@@ -33,12 +35,20 @@ use crate::{
     strategy::BinarySearchStrategy
 };
 
+#[derive(Debug, thiserror::Error)]
+pub enum MatchingEngineError {
+    #[error("No orders were filled")]
+    NoOrdersFilled,
+    #[error(transparent)]
+    SimulationFailed(#[from] eyre::Error)
+}
+
 pub enum MatcherCommand {
     BuildProposal(
         Vec<BookOrder>,
         Vec<OrderWithStorageData<TopOfBlockOrder>>,
         HashMap<PoolId, (Address, Address, BaselinePoolState, u16)>,
-        oneshot::Sender<eyre::Result<(Vec<PoolSolution>, BundleGasDetails)>>
+        oneshot::Sender<Result<(Vec<PoolSolution>, BundleGasDetails), MatchingEngineError>>
     ),
     EstimateGasPerPool {
         limit:    Vec<BookOrder>,
@@ -70,7 +80,10 @@ impl MatchingEngineHandle for MatcherHandle {
         limit: Vec<BookOrder>,
         searcher: Vec<OrderWithStorageData<TopOfBlockOrder>>,
         pools: HashMap<PoolId, (Address, Address, BaselinePoolState, u16)>
-    ) -> futures_util::future::BoxFuture<eyre::Result<(Vec<PoolSolution>, BundleGasDetails)>> {
+    ) -> futures_util::future::BoxFuture<
+        '_,
+        Result<(Vec<PoolSolution>, BundleGasDetails), MatchingEngineError>
+    > {
         Box::pin(async move {
             let (tx, rx) = oneshot::channel();
             self.send_request(rx, MatcherCommand::BuildProposal(limit, searcher, pools, tx))
@@ -99,7 +112,7 @@ impl<TP: TaskSpawner + 'static, V: BundleValidatorHandle> MatchingManager<TP, V>
         let tp = Arc::new(tp);
 
         let fut = manager_thread(rx, tp.clone(), validation).boxed();
-        tp.spawn_critical("matching_engine", fut);
+        tp.spawn_critical_task("matching_engine", fut);
 
         MatcherHandle { sender: tx }
     }
@@ -124,13 +137,15 @@ impl<TP: TaskSpawner + 'static, V: BundleValidatorHandle> MatchingManager<TP, V>
         limit: Vec<BookOrder>,
         searcher: Vec<OrderWithStorageData<TopOfBlockOrder>>,
         pool_snapshots: HashMap<PoolId, (Address, Address, BaselinePoolState, u16)>
-    ) -> eyre::Result<(Vec<PoolSolution>, BundleGasDetails)> {
+    ) -> Result<(Vec<PoolSolution>, BundleGasDetails), MatchingEngineError> {
         // Pull all the orders out of all the preproposals and build OrderPools out of
         // them.  This is ugly and inefficient right now
         let books = Self::build_non_proposal_books(limit.clone(), &pool_snapshots);
 
-        let searcher_orders: HashMap<PoolId, OrderWithStorageData<TopOfBlockOrder>> =
-            searcher.into_iter().fold(HashMap::new(), |mut acc, order| {
+        let searcher_orders: HashMap<PoolId, OrderWithStorageData<TopOfBlockOrder>> = searcher
+            .clone()
+            .into_iter()
+            .fold(HashMap::new(), |mut acc, order| {
                 // assert we are unique per pool
                 assert!(!acc.contains_key(&order.pool_id));
                 acc.entry(order.pool_id).or_insert(order);
@@ -168,9 +183,20 @@ impl<TP: TaskSpawner + 'static, V: BundleValidatorHandle> MatchingManager<TP, V>
         // generate bundle without final gas known.
         trace!("Building bundle for gas finalization");
         let bundle =
-            AngstromBundle::for_gas_finalization(limit, solutions.clone(), &pool_snapshots)?;
+            AngstromBundle::for_gas_finalization(limit.clone(), solutions.clone(), &pool_snapshots)
+                .map_err(|_| MatchingEngineError::NoOrdersFilled)?;
 
-        let gas_response = self.validation_handle.fetch_gas_for_bundle(bundle).await?;
+        let gas_response = self
+            .validation_handle
+            .fetch_gas_for_bundle(bundle)
+            .await
+            .map_err(|e| {
+                let proposal_snapshot =
+                    serde_json::to_vec(&(limit, searcher, pool_snapshots)).unwrap();
+                let hex = hex::encode(proposal_snapshot);
+                tracing::error!(bad_bundle=%hex);
+                MatchingEngineError::SimulationFailed(e)
+            })?;
 
         Ok((solutions, gas_response))
     }

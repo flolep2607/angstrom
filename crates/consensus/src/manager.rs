@@ -15,11 +15,14 @@ use angstrom_metrics::ConsensusMetricsWrapper;
 use angstrom_network::{StromMessage, StromNetworkHandle};
 use angstrom_types::{
     block_sync::BlockSyncConsumer,
-    consensus::{ConsensusRoundName, ConsensusRoundOrderHashes, StromConsensusEvent},
+    consensus::{
+        ConsensusRoundName, ConsensusRoundOrderHashes, StromConsensusEvent, SystemTimeSlotClock
+    },
     contract_payloads::angstrom::UniswapAngstromRegistry,
-    primitive::{AngstromMetaSigner, AngstromSigner, ChainExt},
+    primitive::{AngstromMetaSigner, AngstromSigner},
     sol_bindings::rpc_orders::AttestAngstromBlockEmpty,
-    submission::SubmissionHandler
+    submission::SubmissionHandler,
+    traits::ChainExt
 };
 use futures::StreamExt;
 use matching_engine::MatchingEngineHandle;
@@ -34,7 +37,7 @@ use uniswap_v4::uniswap::pool_manager::SyncedUniswapPools;
 
 use crate::{
     AngstromValidator, ConsensusDataWithBlock, ConsensusRequest, ConsensusSubscriptionData,
-    ConsensusSubscriptionRequestKind,
+    ConsensusSubscriptionRequestKind, ConsensusTimingConfig,
     leader_selection::WeightedRoundRobin,
     rounds::{ConsensusMessage, RoundStateMachine, SharedRoundState}
 };
@@ -81,7 +84,9 @@ where
         matching_engine: Matching,
         block_sync: BlockSync,
         rpc_rx: mpsc::UnboundedReceiver<ConsensusRequest>,
-        state_updates: Option<mpsc::UnboundedSender<ConsensusRoundName>>
+        state_updates: Option<mpsc::UnboundedSender<ConsensusRoundName>>,
+        timing_config: ConsensusTimingConfig,
+        slot_clock: SystemTimeSlotClock
     ) -> Self {
         let ManagerNetworkDeps { network, canonical_block_stream, strom_consensus_event } = netdeps;
         let wrapped_broadcast_stream = BroadcastStream::new(canonical_block_stream);
@@ -90,22 +95,30 @@ where
         let leader = leader_selection.choose_proposer(current_height).unwrap();
         block_sync.register(MODULE_NAME);
 
+        let metrics = ConsensusMetricsWrapper::new();
+        metrics.set_block_height(current_height);
+
         Self {
             strom_consensus_event,
             current_height,
             leader_selection,
-            consensus_round_state: RoundStateMachine::new(SharedRoundState::<_, _, S>::new(
-                current_height,
-                order_storage,
-                signer,
-                leader,
-                validators.clone(),
-                ConsensusMetricsWrapper::new(),
-                pool_registry,
-                uniswap_pools,
-                provider,
-                matching_engine
-            )),
+            consensus_round_state: RoundStateMachine::new(
+                SharedRoundState::<_, _, S>::new(
+                    current_height,
+                    order_storage,
+                    signer,
+                    leader,
+                    validators.clone(),
+                    metrics,
+                    pool_registry,
+                    uniswap_pools,
+                    provider,
+                    matching_engine,
+                    timing_config,
+                    slot_clock.clone()
+                ),
+                slot_clock
+            ),
             rpc_rx,
             state_updates,
             block_sync,
@@ -121,6 +134,7 @@ where
         let new_block = notification.tip();
 
         self.current_height = new_block.number();
+        ConsensusMetricsWrapper::new().set_block_height(self.current_height);
         let round_leader = self
             .leader_selection
             .choose_proposer(self.current_height)
@@ -172,6 +186,20 @@ where
                 self.subscribers
                     .add_subscription(ConsensusSubscriptionRequestKind::RoundEventOrders, tx);
             }
+            ConsensusRequest::Timing(tx) => {
+                let block = self.current_height;
+                let _ = tx.send(ConsensusDataWithBlock {
+                    data: self.consensus_round_state.timing(),
+                    block
+                });
+            }
+            ConsensusRequest::IsRoundClosed(tx) => {
+                let block = self.current_height;
+                let _ = tx.send(ConsensusDataWithBlock {
+                    data: self.consensus_round_state.is_auction_closed(),
+                    block
+                });
+            }
         }
     }
 
@@ -186,14 +214,12 @@ where
             return;
         }
 
-        if let StromConsensusEvent::BundleUnlockAttestation(addr, block, bytes) = &event {
+        if let StromConsensusEvent::BundleUnlockAttestation(_, block, bytes) = &event {
             // verify is correct
             if AttestAngstromBlockEmpty::is_valid_attestation(block + 1, bytes) {
                 let data =
                     ConsensusDataWithBlock { data: bytes.clone(), block: self.current_height };
                 self.subscribers.subscription_send_attestations(data);
-            } else {
-                tracing::warn!(?addr, "got invalid bundle unlock attestation from");
             }
         }
 
